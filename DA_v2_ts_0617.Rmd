@@ -1,0 +1,185 @@
+---
+title: "TS Sales Prediction"
+author: "Anna"
+date: "2024-06-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Clear Global Environment
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.height = 3,
+  fig.width = 6,
+  fig.align = "center"
+)
+rm(list = ls())
+options(
+  scipen = 999,
+  digits = 3
+)
+# Setting the Working Directory
+setwd("~/Desktop/Work/DA/EDA&Prediction")
+
+# Load packages
+library(dplyr) # data manipulation
+library(tidyverse)
+library(janitor)
+library(statar)
+library(lubridate) # date time manipulation
+library(ggplot2) # Plot
+library(plotly)
+library(ggthemes) # Set Theme
+library(ggthemr) 
+library(modelr) # Modeling
+library(forecast)
+pacman::p_load(pacman,modeltime, parsnip, rsample, timetk, broom)
+```
+
+### 1.1 Import data
+```{r}
+data <- read_csv("Sales Analyst CL Ltd.csv") %>%
+  clean_names()
+update <- read_csv("clean_update.csv") %>%
+  clean_names()
+# Check dataset
+glimpse(data)
+```
+
+### 1.2 Data Cleaning
+```{r}
+data <- data %>%
+  mutate(date = ymd(date),
+         year = year(date),
+         month = as.factor(month.abb[month(date)]),
+         day = day(date),
+         wday = wday(date, label = TRUE)) %>%
+  select(sku, qty, month, day, wday, year, date)
+
+update <- update %>%
+  mutate(date = ymd(date)) %>%
+  select(sku, qty, date)
+```
+
+### 1.3 Data Manipulation
+#### 1.3.1 Historical Data
+```{r}
+data_ts <- data %>%
+  group_by(date) %>%
+  summarise(total_sale_qty = sum(qty))
+```
+
+#### 1.3.2 Updated Data
+```{r}
+# Set up date range
+start_date <- as.Date("2024-06-15")
+end_date <- as.Date("2024-06-17")
+num_dates <- 143  # Number of dates to generate
+
+# Generate random dates
+random_dates <- sample(seq(start_date, end_date, by = "day"), num_dates, replace = TRUE)
+table(random_dates)
+
+# Change part of 0615
+update_df <- update %>%
+  mutate(date_atc = random_dates) %>%
+  arrange(date_atc)
+update_df[1:19, 4] <- as.Date("2024-06-16")
+table(update_df$date_atc)
+# Change part of 0617
+update_df <- update_df %>%
+  arrange(date_atc)
+update_df[136:143, 4] <- as.Date("2024-06-16")
+```
+
+```{r}
+# Data aggregation
+update_df <- update_df %>%
+  group_by(date_atc) %>%
+  summarise(total_sale_qty = sum(qty))
+colnames(update_df)[1] <- c("date")
+```
+
+### 1.3.3 Merging Data
+```{r}
+df_ts <- rbind(data_ts, update_df)
+```
+
+## 2. Data Visualization
+```{r}
+df_ts %>%
+  plot_time_series(date, total_sale_qty, .interactive = TRUE)
+```
+## 3. Sale Forecasting
+### 3.1 Split dataset
+```{r}
+set.seed(231)
+
+#Split data into test and training set
+split <- df_ts %>%
+  time_series_split(date_var = date, 
+                    assess = "1 months", # use the last month as test set
+                    cumulative = TRUE)
+#Visualize test train split
+split %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(date, total_sale_qty, .interactive = TRUE)
+```
+
+### 3.2 Model Fit
+```{r}
+model_fit_prophet  <- prophet_reg() %>%
+    set_engine('prophet') %>% 
+  fit(total_sale_qty ~ ., data = training(split))
+
+# Put model into a modeltime table
+models_tbl <- modeltime_table(model_fit_prophet)
+models_tbl
+
+# Calibrate model
+calibration_tbl <- models_tbl %>% 
+  modeltime_calibrate(new_data = testing(split))
+
+# Check model accuracy
+(accuracy_table <- calibration_tbl %>%
+    modeltime_accuracy())
+```
+
+### 3.3 Forecast test data
+```{r}
+#Step 6: Create future forecast on test data
+(forecast_tbl <- calibration_tbl %>%
+    modeltime_forecast(
+        new_data    = testing(split),
+        actual_data = data_ts,
+        keep_data = TRUE
+    ))
+plot_modeltime_forecast(forecast_tbl)
+```
+
+```{r}
+#Create a tibble of observations with length out being the number of observations we want in reference to our date variable (new_data)
+#Create tibble of dates
+dates <- df_ts %>% 
+  future_frame(date, .length_out = "3 months")
+
+#Put data into dataframe
+explanatory_data <- dates
+
+# Refit to the full dataset
+refit_tbl <- calibration_tbl %>%
+  modeltime_refit(df_ts)
+
+#Forecast on the new tibble dataframe
+forecast_tbl_future_data <- refit_tbl %>%
+    modeltime_forecast(
+        new_data    = dates
+    )
+
+#Check results of forecast
+head(forecast_tbl_future_data)
+
+plot_modeltime_forecast(forecast_tbl_future_data, .interactive = TRUE)
+```
